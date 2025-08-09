@@ -34,6 +34,10 @@
 (define-constant MAX_BENEFICIARIES u5)
 (define-constant MAX_DELEGATES u10)
 
+;; System principals to reject
+(define-constant BURN_ADDRESS 'SP000000000000000000002Q6VF78)
+(define-constant SYSTEM_ADDRESS 'ST000000000000000000002AMW42H)
+
 ;; ===== ERROR CODES =====
 (define-constant ERR_UNAUTHORIZED (err u100))
 (define-constant ERR_INVALID_AMOUNT (err u101))
@@ -52,6 +56,8 @@
 (define-constant ERR_NOT_BENEFICIARY (err u114))
 (define-constant ERR_VAULT_EXISTS (err u115))
 (define-constant ERR_ARITHMETIC_OVERFLOW (err u116))
+(define-constant ERR_INVALID_PRINCIPAL (err u117))
+(define-constant ERR_INVALID_CONTRACT (err u118))
 
 ;; ===== DATA VARIABLES =====
 (define-data-var contract-admin principal CONTRACT_OWNER)
@@ -102,12 +108,36 @@
         lock-count: uint
     })
 
+;; ===== VALIDATION FUNCTIONS =====
+(define-private (is-valid-principal (principal-to-check principal))
+    (and 
+        (not (is-eq principal-to-check BURN_ADDRESS))
+        (not (is-eq principal-to-check SYSTEM_ADDRESS))
+        (not (is-eq principal-to-check 'SP000000000000000000002Q6VF78))))
+
+(define-private (is-valid-contract-principal (contract-principal principal))
+    (and 
+        (is-valid-principal contract-principal)
+        (is-ok (principal-destruct? contract-principal))))
+
+(define-private (validate-amount (amount uint))
+    (and (>= amount MIN_AMOUNT) (<= amount MAX_AMOUNT)))
+
+(define-private (validate-duration (duration uint))
+    (and (>= duration MIN_LOCK_DURATION) (<= duration MAX_LOCK_DURATION)))
+
+(define-private (validate-unlock-height (unlock-height uint))
+    (> unlock-height stacks-block-height))
+
+(define-private (validate-bonus-rate (bonus-rate uint))
+    (and (>= bonus-rate MIN_BONUS_RATE) (<= bonus-rate MAX_BONUS_RATE)))
+
 ;; ===== HELPER FUNCTIONS =====
 (define-private (validate-lock-params (amount uint) (duration uint) (unlock-height uint))
     (begin
-        (asserts! (and (>= amount MIN_AMOUNT) (<= amount MAX_AMOUNT)) ERR_INVALID_AMOUNT)
-        (asserts! (and (>= duration MIN_LOCK_DURATION) (<= duration MAX_LOCK_DURATION)) ERR_INVALID_DURATION)
-        (asserts! (> unlock-height stacks-block-height) ERR_INVALID_DURATION)
+        (asserts! (validate-amount amount) ERR_INVALID_AMOUNT)
+        (asserts! (validate-duration duration) ERR_INVALID_DURATION)
+        (asserts! (validate-unlock-height unlock-height) ERR_INVALID_DURATION)
         (ok true)))
 
 (define-private (get-tier-bonus (duration uint))
@@ -162,8 +192,16 @@
             (asserts! (> num-beneficiaries u0) ERR_INVALID_BENEFICIARIES)
             (asserts! (<= num-beneficiaries MAX_BENEFICIARIES) ERR_INVALID_BENEFICIARIES)
             (asserts! (is-eq total-shares u100) ERR_INVALID_SHARES)
+            ;; Validate all beneficiary principals
+            (asserts! (is-eq (len (filter is-valid-beneficiary-entry beneficiaries-list)) num-beneficiaries) ERR_INVALID_PRINCIPAL)
             (ok true)
         )))
+
+(define-private (is-valid-beneficiary-entry (entry { beneficiary: principal, share: uint, approved: bool }))
+    (and 
+        (is-valid-principal (get beneficiary entry))
+        (> (get share entry) u0)
+        (<= (get share entry) u100)))
 
 (define-private (get-beneficiary-share (entry { beneficiary: principal, share: uint, approved: bool }))
     (get share entry))
@@ -183,6 +221,9 @@
 (define-public (set-contract-admin (new-admin principal))
     (begin
         (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+        ;; Validate the new admin principal
+        (asserts! (is-valid-principal new-admin) ERR_INVALID_PRINCIPAL)
+        (asserts! (not (is-eq new-admin tx-sender)) ERR_INVALID_PRINCIPAL)
         (var-set contract-admin new-admin)
         (ok new-admin)))
 
@@ -204,8 +245,8 @@
 (define-public (set-tier-reward (duration uint) (bonus-rate uint))
     (begin
         (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
-        (asserts! (and (>= duration MIN_LOCK_DURATION) (<= duration MAX_LOCK_DURATION)) ERR_INVALID_DURATION)
-        (asserts! (and (>= bonus-rate MIN_BONUS_RATE) (<= bonus-rate MAX_BONUS_RATE)) ERR_INVALID_BONUS_RATE)
+        (asserts! (validate-duration duration) ERR_INVALID_DURATION)
+        (asserts! (validate-bonus-rate bonus-rate) ERR_INVALID_BONUS_RATE)
         (ok (map-set tier-rewards 
             { lock-duration: duration }
             { bonus-rate: bonus-rate }))))
@@ -214,10 +255,10 @@
 (define-public (lock-funds (amount uint) (unlock-height uint))
     (let (
         (validated-amount (begin 
-            (asserts! (and (>= amount MIN_AMOUNT) (<= amount MAX_AMOUNT)) ERR_INVALID_AMOUNT)
+            (asserts! (validate-amount amount) ERR_INVALID_AMOUNT)
             amount))
         (validated-unlock-height (begin
-            (asserts! (> unlock-height stacks-block-height) ERR_INVALID_DURATION)
+            (asserts! (validate-unlock-height unlock-height) ERR_INVALID_DURATION)
             unlock-height))
         (duration (unwrap! (safe-subtract validated-unlock-height stacks-block-height) ERR_INVALID_DURATION))
         (bonus-info (get-tier-bonus duration))
@@ -309,15 +350,17 @@
     (unlock-height uint))
     (let (
         (validated-amount (begin 
-            (asserts! (and (>= amount MIN_AMOUNT) (<= amount MAX_AMOUNT)) ERR_INVALID_AMOUNT)
+            (asserts! (validate-amount amount) ERR_INVALID_AMOUNT)
             amount))
         (validated-unlock-height (begin
-            (asserts! (> unlock-height stacks-block-height) ERR_INVALID_DURATION)
+            (asserts! (validate-unlock-height unlock-height) ERR_INVALID_DURATION)
             unlock-height))
         (duration (unwrap! (safe-subtract validated-unlock-height stacks-block-height) ERR_INVALID_DURATION))
         (token-principal (contract-of token-contract)))
         (begin
             (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
+            ;; Validate token contract principal
+            (asserts! (is-valid-contract-principal token-principal) ERR_INVALID_CONTRACT)
             (try! (validate-lock-params validated-amount duration validated-unlock-height))
             (asserts! (is-none (map-get? token-vault { owner: tx-sender, token-contract: token-principal })) ERR_VAULT_EXISTS)
             
@@ -332,6 +375,7 @@
                             original-amount: validated-amount,
                             lock-timestamp: stacks-block-height
                         })
+                    (unwrap! (update-user-stats tx-sender validated-amount u0 u1) ERR_ARITHMETIC_OVERFLOW)
                     (ok true))
                 error ERR_TRANSFER_FAILED))))
 
@@ -341,6 +385,8 @@
         (vault-info (unwrap! (map-get? token-vault { owner: tx-sender, token-contract: token-principal }) ERR_VAULT_NOT_FOUND)))
         (begin
             (asserts! (>= stacks-block-height (get unlock-height vault-info)) ERR_STILL_LOCKED)
+            ;; Validate token contract principal
+            (asserts! (is-valid-contract-principal token-principal) ERR_INVALID_CONTRACT)
             
             ;; Validate amount before transfer
             (let ((withdraw-amount (get amount vault-info)))
@@ -355,17 +401,123 @@
                         none))
                         success (begin
                             (map-delete token-vault { owner: tx-sender, token-contract: token-principal })
+                            (unwrap! (update-user-stats tx-sender u0 withdraw-amount u0) ERR_ARITHMETIC_OVERFLOW)
                             (ok withdraw-amount))
                         error ERR_TRANSFER_FAILED))))))
+
+(define-public (partial-withdraw-tokens (token-contract <token-trait>) (withdraw-amount uint))
+    (let (
+        (token-principal (contract-of token-contract))
+        (vault-info (unwrap! (map-get? token-vault { owner: tx-sender, token-contract: token-principal }) ERR_VAULT_NOT_FOUND)))
+        (begin
+            (asserts! (>= stacks-block-height (get unlock-height vault-info)) ERR_STILL_LOCKED)
+            (asserts! (> withdraw-amount u0) ERR_INVALID_AMOUNT)
+            (asserts! (>= (get amount vault-info) withdraw-amount) ERR_INSUFFICIENT_BALANCE)
+            ;; Validate token contract principal
+            (asserts! (is-valid-contract-principal token-principal) ERR_INVALID_CONTRACT)
+            
+            (let (
+                (current-amount (get amount vault-info))
+                (remaining-amount (unwrap! (safe-subtract current-amount withdraw-amount) ERR_INSUFFICIENT_BALANCE))
+            )
+                (begin
+                    ;; Transfer tokens back
+                    (match (as-contract (contract-call? token-contract transfer 
+                        withdraw-amount 
+                        tx-sender 
+                        tx-sender 
+                        none))
+                        success (begin
+                            ;; Update vault or delete if empty
+                            (if (is-eq remaining-amount u0)
+                                (map-delete token-vault { owner: tx-sender, token-contract: token-principal })
+                                (map-set token-vault 
+                                    { owner: tx-sender, token-contract: token-principal }
+                                    (merge vault-info { amount: remaining-amount })))
+                            
+                            (unwrap! (update-user-stats tx-sender u0 withdraw-amount u0) ERR_ARITHMETIC_OVERFLOW)
+                            (ok withdraw-amount))
+                        error ERR_TRANSFER_FAILED))))))
+
+;; ===== BENEFICIARY FUNCTIONS =====
+(define-public (add-beneficiary (beneficiary principal) (share uint))
+    (let (
+        (current-beneficiaries (default-to (list) (map-get? beneficiaries tx-sender)))
+        (current-count (len current-beneficiaries))
+    )
+        (begin
+            (asserts! (< current-count MAX_BENEFICIARIES) ERR_INVALID_BENEFICIARIES)
+            (asserts! (> share u0) ERR_INVALID_SHARES)
+            (asserts! (<= share u100) ERR_INVALID_SHARES)
+            ;; Validate beneficiary principal
+            (asserts! (is-valid-principal beneficiary) ERR_INVALID_PRINCIPAL)
+            (asserts! (not (is-eq beneficiary tx-sender)) ERR_INVALID_PRINCIPAL)
+            
+            ;; Check total shares don't exceed 100%
+            (let ((total-shares (fold + (map get-beneficiary-share current-beneficiaries) share)))
+                (asserts! (<= total-shares u100) ERR_INVALID_SHARES)
+                
+                (map-set beneficiaries tx-sender 
+                    (unwrap! (as-max-len? (append current-beneficiaries {beneficiary: beneficiary, share: share, approved: false}) u5) 
+                             ERR_INVALID_BENEFICIARIES))
+                (ok true)))))
+
+(define-public (approve-beneficiary-status)
+    (let (
+        (current-beneficiaries (unwrap! (map-get? beneficiaries tx-sender) ERR_NOT_BENEFICIARY))
+    )
+        (begin
+            (asserts! (is-beneficiary-in-list current-beneficiaries tx-sender) ERR_NOT_BENEFICIARY)
+            (map-set beneficiaries tx-sender (map update-beneficiary-approval current-beneficiaries))
+            (ok true))))
 
 ;; ===== EMERGENCY FUNCTIONS =====
 (define-public (emergency-withdraw (user principal))
     (begin
         (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
         (asserts! (var-get emergency-mode) ERR_EMERGENCY_MODE_REQUIRED)
+        ;; Validate user principal
+        (asserts! (is-valid-principal user) ERR_INVALID_PRINCIPAL)
         
         (match (map-get? stx-vault { owner: user })
-            vault-info (begin
-                ;; Add your emergency withdrawal logic here, e.g. transfer funds to user, update state, etc.
-                (ok vault-info))
+            vault-info (let (
+                (withdraw-amount (get amount vault-info))
+                (original-amount (get original-amount vault-info))
+            )
+                (begin
+                    ;; Transfer funds to user
+                    (try! (as-contract (stx-transfer? withdraw-amount tx-sender user)))
+                    
+                    ;; Update state
+                    (let ((new-total-locked (unwrap! (safe-subtract (var-get total-locked-stx) original-amount) ERR_INSUFFICIENT_BALANCE)))
+                        (var-set total-locked-stx new-total-locked))
+                    
+                    ;; Clean up vault
+                    (map-delete stx-vault { owner: user })
+                    (ok withdraw-amount)))
             ERR_VAULT_NOT_FOUND)))
+
+;; ===== READ-ONLY FUNCTIONS =====
+(define-read-only (get-vault-info (owner principal))
+    (map-get? stx-vault { owner: owner }))
+
+(define-read-only (get-token-vault-info (owner principal) (token-contract principal))
+    (map-get? token-vault { owner: owner, token-contract: token-contract }))
+
+(define-read-only (get-user-stats (user principal))
+    (map-get? user-stats user))
+
+(define-read-only (get-tier-reward (duration uint))
+    (map-get? tier-rewards { lock-duration: duration }))
+
+(define-read-only (get-contract-admin)
+    (var-get contract-admin))
+
+(define-read-only (get-emergency-mode)
+    (var-get emergency-mode))
+
+(define-read-only (get-contract-paused)
+    (var-get contract-paused))
+
+(define-read-only (get-total-locked-stx)
+    (var-get total-locked-stx))
