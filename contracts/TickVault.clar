@@ -58,12 +58,16 @@
 (define-constant ERR_ARITHMETIC_OVERFLOW (err u116))
 (define-constant ERR_INVALID_PRINCIPAL (err u117))
 (define-constant ERR_INVALID_CONTRACT (err u118))
+(define-constant ERR_INSUFFICIENT_TREASURY (err u119))
 
 ;; ===== DATA VARIABLES =====
 (define-data-var contract-admin principal CONTRACT_OWNER)
 (define-data-var emergency-mode bool false)
 (define-data-var total-locked-stx uint u0)
 (define-data-var contract-paused bool false)
+;; Treasury management variables
+(define-data-var bonus-treasury uint u0)
+(define-data-var total-bonus-obligations uint u0)
 
 ;; ===== DATA MAPS =====
 (define-map stx-vault 
@@ -217,6 +221,35 @@
         (merge entry { approved: true })
         entry))
 
+;; ===== TREASURY MANAGEMENT FUNCTIONS =====
+(define-public (fund-bonus-treasury (amount uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (let ((new-treasury (unwrap! (safe-add (var-get bonus-treasury) amount) ERR_ARITHMETIC_OVERFLOW)))
+            (var-set bonus-treasury new-treasury))
+        (ok amount)))
+
+(define-public (withdraw-from-treasury (amount uint) (recipient principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+        (asserts! (is-valid-principal recipient) ERR_INVALID_PRINCIPAL)
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (let (
+            (current-treasury (var-get bonus-treasury))
+            (current-obligations (var-get total-bonus-obligations))
+            (available-treasury (if (>= current-treasury current-obligations) 
+                                   (- current-treasury current-obligations) 
+                                   u0))
+        )
+            (begin
+                (asserts! (>= available-treasury amount) ERR_INSUFFICIENT_TREASURY)
+                (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+                (let ((new-treasury (unwrap! (safe-subtract current-treasury amount) ERR_INSUFFICIENT_BALANCE)))
+                    (var-set bonus-treasury new-treasury))
+                (ok amount)))))
+
 ;; ===== ADMIN FUNCTIONS =====
 (define-public (set-contract-admin (new-admin principal))
     (begin
@@ -263,15 +296,22 @@
         (duration (unwrap! (safe-subtract validated-unlock-height stacks-block-height) ERR_INVALID_DURATION))
         (bonus-info (get-tier-bonus duration))
         (bonus-rate (get bonus-rate bonus-info))
-        (bonus-calculation (unwrap! (safe-multiply validated-amount bonus-rate) ERR_ARITHMETIC_OVERFLOW))
-        (bonus-amount (/ bonus-calculation u100)))
+        ;; Calculate actual bonus amount (not total with bonus)
+        (bonus-calculation (unwrap! (safe-multiply validated-amount (- bonus-rate u100)) ERR_ARITHMETIC_OVERFLOW))
+        (bonus-amount (/ bonus-calculation u100))
+        (total-amount (unwrap! (safe-add validated-amount bonus-amount) ERR_ARITHMETIC_OVERFLOW)))
         (begin
             ;; Pre-conditions
             (asserts! (not (var-get contract-paused)) ERR_UNAUTHORIZED)
             (try! (validate-lock-params validated-amount duration validated-unlock-height))
             (asserts! (is-none (map-get? stx-vault { owner: tx-sender })) ERR_VAULT_EXISTS)
             
-            ;; Transfer STX to contract
+            ;; Ensure treasury can cover bonus obligations
+            (let ((new-bonus-obligations (unwrap! (safe-add (var-get total-bonus-obligations) bonus-amount) ERR_ARITHMETIC_OVERFLOW)))
+                (asserts! (<= new-bonus-obligations (var-get bonus-treasury)) ERR_INSUFFICIENT_TREASURY)
+                (var-set total-bonus-obligations new-bonus-obligations))
+            
+            ;; FIXED: Transfer STX from user to contract
             (try! (stx-transfer? validated-amount tx-sender (as-contract tx-sender)))
             
             ;; Update state with safe operations
@@ -279,11 +319,11 @@
                 (var-set total-locked-stx new-total-locked))
             (unwrap! (update-user-stats tx-sender validated-amount u0 u1) ERR_ARITHMETIC_OVERFLOW)
             
-            ;; Create vault entry
+            ;; Create vault entry with separate tracking of original and bonus amounts
             (ok (map-set stx-vault 
                 { owner: tx-sender }
                 { 
-                    amount: bonus-amount,
+                    amount: total-amount,  ;; Total withdrawable amount
                     unlock-height: validated-unlock-height,
                     original-amount: validated-amount,
                     lock-timestamp: stacks-block-height
@@ -295,23 +335,34 @@
             (asserts! (>= stacks-block-height (get unlock-height vault-info)) ERR_STILL_LOCKED)
             (asserts! (> (get amount vault-info) u0) ERR_INSUFFICIENT_BALANCE)
             
-            ;; Validate amounts before operations
             (let (
-                (withdraw-amount (get amount vault-info))
+                (total-withdraw-amount (get amount vault-info))
                 (original-amount (get original-amount vault-info))
+                (bonus-amount (unwrap! (safe-subtract total-withdraw-amount original-amount) ERR_ARITHMETIC_OVERFLOW))
             )
                 (begin
-                    ;; Transfer funds back
-                    (try! (as-contract (stx-transfer? withdraw-amount tx-sender tx-sender)))
+                    ;; FIXED: Transfer original amount from locked funds
+                    (try! (as-contract (stx-transfer? original-amount tx-sender tx-sender)))
                     
-                    ;; Update state with safe operations
+                    ;; Transfer bonus from treasury if any
+                    (if (> bonus-amount u0)
+                        (begin
+                            (try! (as-contract (stx-transfer? bonus-amount tx-sender tx-sender)))
+                            ;; Update treasury and obligations
+                            (let ((new-treasury (unwrap! (safe-subtract (var-get bonus-treasury) bonus-amount) ERR_INSUFFICIENT_BALANCE))
+                                  (new-obligations (unwrap! (safe-subtract (var-get total-bonus-obligations) bonus-amount) ERR_INSUFFICIENT_BALANCE)))
+                                (var-set bonus-treasury new-treasury)
+                                (var-set total-bonus-obligations new-obligations)))
+                        true)
+                    
+                    ;; Update state
                     (let ((new-total-locked (unwrap! (safe-subtract (var-get total-locked-stx) original-amount) ERR_INSUFFICIENT_BALANCE)))
                         (var-set total-locked-stx new-total-locked))
-                    (unwrap! (update-user-stats tx-sender u0 withdraw-amount u0) ERR_ARITHMETIC_OVERFLOW)
+                    (unwrap! (update-user-stats tx-sender u0 total-withdraw-amount u0) ERR_ARITHMETIC_OVERFLOW)
                     
                     ;; Clean up
                     (map-delete stx-vault { owner: tx-sender })
-                    (ok withdraw-amount))))))
+                    (ok total-withdraw-amount))))))
 
 (define-public (partial-withdraw (withdraw-amount uint))
     (let ((vault-info (unwrap! (map-get? stx-vault { owner: tx-sender }) ERR_VAULT_NOT_FOUND)))
@@ -320,15 +371,29 @@
             (asserts! (>= (get amount vault-info) withdraw-amount) ERR_INSUFFICIENT_BALANCE)
             (asserts! (> withdraw-amount u0) ERR_INVALID_AMOUNT)
             
-            ;; Validate and perform safe operations
             (let (
                 (current-amount (get amount vault-info))
                 (original-amount (get original-amount vault-info))
                 (remaining-amount (unwrap! (safe-subtract current-amount withdraw-amount) ERR_INSUFFICIENT_BALANCE))
+                (total-bonus (unwrap! (safe-subtract current-amount original-amount) ERR_ARITHMETIC_OVERFLOW))
+                ;; Calculate proportional bonus for this withdrawal
+                (bonus-portion (if (> total-bonus u0) (/ (* total-bonus withdraw-amount) current-amount) u0))
+                (principal-portion (- withdraw-amount bonus-portion))
             )
                 (begin
-                    ;; Transfer partial amount
-                    (try! (as-contract (stx-transfer? withdraw-amount tx-sender tx-sender)))
+                    ;; FIXED: Transfer principal portion from locked funds
+                    (try! (as-contract (stx-transfer? principal-portion tx-sender tx-sender)))
+                    
+                    ;; Transfer bonus portion from treasury if any
+                    (if (> bonus-portion u0)
+                        (begin
+                            (try! (as-contract (stx-transfer? bonus-portion tx-sender tx-sender)))
+                            ;; Update treasury and obligations
+                            (let ((new-treasury (unwrap! (safe-subtract (var-get bonus-treasury) bonus-portion) ERR_INSUFFICIENT_BALANCE))
+                                  (new-obligations (unwrap! (safe-subtract (var-get total-bonus-obligations) bonus-portion) ERR_INSUFFICIENT_BALANCE)))
+                                (var-set bonus-treasury new-treasury)
+                                (var-set total-bonus-obligations new-obligations)))
+                        true)
                     
                     ;; Update vault or delete if empty
                     (if (is-eq remaining-amount u0)
@@ -364,9 +429,10 @@
             (try! (validate-lock-params validated-amount duration validated-unlock-height))
             (asserts! (is-none (map-get? token-vault { owner: tx-sender, token-contract: token-principal })) ERR_VAULT_EXISTS)
             
-            ;; Transfer tokens to contract
+            ;; FIXED: Transfer tokens from user to contract with proper SIP-010 signature
             (match (contract-call? token-contract transfer validated-amount tx-sender (as-contract tx-sender) none)
                 success (begin
+                    (asserts! success ERR_TRANSFER_FAILED)
                     (map-set token-vault 
                         { owner: tx-sender, token-contract: token-principal }
                         { 
@@ -388,18 +454,18 @@
             ;; Validate token contract principal
             (asserts! (is-valid-contract-principal token-principal) ERR_INVALID_CONTRACT)
             
-            ;; Validate amount before transfer
             (let ((withdraw-amount (get amount vault-info)))
                 (begin
                     (asserts! (> withdraw-amount u0) ERR_INSUFFICIENT_BALANCE)
                     
-                    ;; Transfer tokens back
+                    ;; FIXED: Transfer tokens from contract back to user
                     (match (as-contract (contract-call? token-contract transfer 
                         withdraw-amount 
-                        tx-sender 
-                        tx-sender 
+                        tx-sender  ;; from: contract (as-contract context)
+                        tx-sender  ;; to: original caller (vault owner)
                         none))
                         success (begin
+                            (asserts! success ERR_TRANSFER_FAILED)
                             (map-delete token-vault { owner: tx-sender, token-contract: token-principal })
                             (unwrap! (update-user-stats tx-sender u0 withdraw-amount u0) ERR_ARITHMETIC_OVERFLOW)
                             (ok withdraw-amount))
@@ -421,13 +487,14 @@
                 (remaining-amount (unwrap! (safe-subtract current-amount withdraw-amount) ERR_INSUFFICIENT_BALANCE))
             )
                 (begin
-                    ;; Transfer tokens back
+                    ;; FIXED: Transfer tokens from contract back to user
                     (match (as-contract (contract-call? token-contract transfer 
                         withdraw-amount 
-                        tx-sender 
-                        tx-sender 
+                        tx-sender  ;; from: contract (as-contract context)
+                        tx-sender  ;; to: original caller (vault owner)
                         none))
                         success (begin
+                            (asserts! success ERR_TRANSFER_FAILED)
                             ;; Update vault or delete if empty
                             (if (is-eq remaining-amount u0)
                                 (map-delete token-vault { owner: tx-sender, token-contract: token-principal })
@@ -481,12 +548,24 @@
         
         (match (map-get? stx-vault { owner: user })
             vault-info (let (
-                (withdraw-amount (get amount vault-info))
+                (total-withdraw-amount (get amount vault-info))
                 (original-amount (get original-amount vault-info))
+                (bonus-amount (unwrap! (safe-subtract total-withdraw-amount original-amount) ERR_ARITHMETIC_OVERFLOW))
             )
                 (begin
-                    ;; Transfer funds to user
-                    (try! (as-contract (stx-transfer? withdraw-amount tx-sender user)))
+                    ;; FIXED: Transfer original amount from locked funds to vault owner
+                    (try! (as-contract (stx-transfer? original-amount tx-sender user)))
+                    
+                    ;; Transfer bonus from treasury if any
+                    (if (> bonus-amount u0)
+                        (begin
+                            (try! (as-contract (stx-transfer? bonus-amount tx-sender user)))
+                            ;; Update treasury and obligations
+                            (let ((new-treasury (unwrap! (safe-subtract (var-get bonus-treasury) bonus-amount) ERR_INSUFFICIENT_BALANCE))
+                                  (new-obligations (unwrap! (safe-subtract (var-get total-bonus-obligations) bonus-amount) ERR_INSUFFICIENT_BALANCE)))
+                                (var-set bonus-treasury new-treasury)
+                                (var-set total-bonus-obligations new-obligations)))
+                        true)
                     
                     ;; Update state
                     (let ((new-total-locked (unwrap! (safe-subtract (var-get total-locked-stx) original-amount) ERR_INSUFFICIENT_BALANCE)))
@@ -494,7 +573,7 @@
                     
                     ;; Clean up vault
                     (map-delete stx-vault { owner: user })
-                    (ok withdraw-amount)))
+                    (ok total-withdraw-amount)))
             ERR_VAULT_NOT_FOUND)))
 
 ;; ===== READ-ONLY FUNCTIONS =====
@@ -521,3 +600,31 @@
 
 (define-read-only (get-total-locked-stx)
     (var-get total-locked-stx))
+
+;; Treasury read-only functions
+(define-read-only (get-bonus-treasury)
+    (var-get bonus-treasury))
+
+(define-read-only (get-total-bonus-obligations)
+    (var-get total-bonus-obligations))
+
+(define-read-only (get-available-treasury)
+    (let (
+        (treasury (var-get bonus-treasury))
+        (obligations (var-get total-bonus-obligations))
+    )
+        (if (>= treasury obligations) 
+            (- treasury obligations) 
+            u0)))
+
+;; Contract balance verification
+(define-read-only (verify-contract-balance)
+    (let (
+        (contract-balance (stx-get-balance (as-contract tx-sender)))
+        (tracked-balance (+ (var-get total-locked-stx) (var-get bonus-treasury)))
+    )
+        {
+            contract-balance: contract-balance,
+            tracked-balance: tracked-balance,
+            balance-matches: (>= contract-balance tracked-balance)
+        }))
