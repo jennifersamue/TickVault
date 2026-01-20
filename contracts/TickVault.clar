@@ -336,18 +336,19 @@
             (asserts! (> (get amount vault-info) u0) ERR_INSUFFICIENT_BALANCE)
             
             (let (
+                (caller tx-sender)
                 (total-withdraw-amount (get amount vault-info))
                 (original-amount (get original-amount vault-info))
                 (bonus-amount (unwrap! (safe-subtract total-withdraw-amount original-amount) ERR_ARITHMETIC_OVERFLOW))
             )
                 (begin
                     ;; FIXED: Transfer original amount from locked funds
-                    (try! (as-contract (stx-transfer? original-amount tx-sender tx-sender)))
+                    (try! (as-contract (stx-transfer? original-amount tx-sender caller)))
                     
                     ;; Transfer bonus from treasury if any
                     (if (> bonus-amount u0)
                         (begin
-                            (try! (as-contract (stx-transfer? bonus-amount tx-sender tx-sender)))
+                            (try! (as-contract (stx-transfer? bonus-amount tx-sender caller)))
                             ;; Update treasury and obligations
                             (let ((new-treasury (unwrap! (safe-subtract (var-get bonus-treasury) bonus-amount) ERR_INSUFFICIENT_BALANCE))
                                   (new-obligations (unwrap! (safe-subtract (var-get total-bonus-obligations) bonus-amount) ERR_INSUFFICIENT_BALANCE)))
@@ -372,6 +373,7 @@
             (asserts! (> withdraw-amount u0) ERR_INVALID_AMOUNT)
             
             (let (
+                (caller tx-sender)
                 (current-amount (get amount vault-info))
                 (original-amount (get original-amount vault-info))
                 (remaining-amount (unwrap! (safe-subtract current-amount withdraw-amount) ERR_INSUFFICIENT_BALANCE))
@@ -382,12 +384,12 @@
             )
                 (begin
                     ;; FIXED: Transfer principal portion from locked funds
-                    (try! (as-contract (stx-transfer? principal-portion tx-sender tx-sender)))
+                    (try! (as-contract (stx-transfer? principal-portion tx-sender caller)))
                     
                     ;; Transfer bonus portion from treasury if any
                     (if (> bonus-portion u0)
                         (begin
-                            (try! (as-contract (stx-transfer? bonus-portion tx-sender tx-sender)))
+                            (try! (as-contract (stx-transfer? bonus-portion tx-sender caller)))
                             ;; Update treasury and obligations
                             (let ((new-treasury (unwrap! (safe-subtract (var-get bonus-treasury) bonus-portion) ERR_INSUFFICIENT_BALANCE))
                                   (new-obligations (unwrap! (safe-subtract (var-get total-bonus-obligations) bonus-portion) ERR_INSUFFICIENT_BALANCE)))
@@ -454,7 +456,10 @@
             ;; Validate token contract principal
             (asserts! (is-valid-contract-principal token-principal) ERR_INVALID_CONTRACT)
             
-            (let ((withdraw-amount (get amount vault-info)))
+            (let (
+                (caller tx-sender)
+                (withdraw-amount (get amount vault-info))
+            )
                 (begin
                     (asserts! (> withdraw-amount u0) ERR_INSUFFICIENT_BALANCE)
                     
@@ -462,7 +467,7 @@
                     (match (as-contract (contract-call? token-contract transfer 
                         withdraw-amount 
                         tx-sender  ;; from: contract (as-contract context)
-                        tx-sender  ;; to: original caller (vault owner)
+                        caller  ;; to: original caller (vault owner)
                         none))
                         success (begin
                             (asserts! success ERR_TRANSFER_FAILED)
@@ -483,6 +488,7 @@
             (asserts! (is-valid-contract-principal token-principal) ERR_INVALID_CONTRACT)
             
             (let (
+                (caller tx-sender)
                 (current-amount (get amount vault-info))
                 (remaining-amount (unwrap! (safe-subtract current-amount withdraw-amount) ERR_INSUFFICIENT_BALANCE))
             )
@@ -491,7 +497,7 @@
                     (match (as-contract (contract-call? token-contract transfer 
                         withdraw-amount 
                         tx-sender  ;; from: contract (as-contract context)
-                        tx-sender  ;; to: original caller (vault owner)
+                        caller  ;; to: original caller (vault owner)
                         none))
                         success (begin
                             (asserts! success ERR_TRANSFER_FAILED)
